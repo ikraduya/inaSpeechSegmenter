@@ -154,6 +154,55 @@ class DnnSegmenter:
                 ret.append((self.outlabels[int(lab2)], start2+start, stop2+start))            
         return ret
 
+    def analyze(self, mspec, lseg, difflen = 0):
+        """
+        *** input
+        * mspec: mel spectrogram
+        * lseg: list of tuples (label, start, stop) corresponding to previous segmentations
+        * difflen: 0 if the original length of the mel spectrogram is >= 68
+                otherwise it is set to 68 - length(mspec)
+        *** output
+        a list of adjacent tuples (label, start, stop)
+        """
+        assert(len(lseg) == 1)
+        lseg = lseg[0]
+
+        if self.nmel < 24:
+            mspec = mspec[:, :self.nmel].copy()
+        
+        patches, finite = _get_patches(mspec, 68, 2)
+        if difflen > 0:
+            patches = patches[:-int(difflen / 2), :, :]
+            finite = finite[:-int(difflen / 2)]
+            
+        assert len(finite) == len(patches), (len(patches), len(finite))
+            
+        batch = [patches, ]
+
+        if len(batch) > 0:
+            batch = np.concatenate(batch)
+            rawpred = self.nn.predict(batch, batch_size=self.batch_size)
+
+        ret = []
+        r = rawpred
+        rawpred = rawpred
+        r[finite == False, :] = 0.5
+        pred = viterbi_decoding(np.log(r), diag_trans_exp(self.viterbi_arg, len(self.outlabels)))
+        
+        ct_speech = 0
+        ct_music = 0
+        ct_noise = 0
+        for p in pred:
+            if p == 0:
+                ct_speech += 1
+            elif p == 1:
+                ct_music += 1
+            elif p == 2:
+                ct_noise += 1
+
+        total_ct = ct_speech + ct_music + ct_noise
+        ret = (float(ct_speech) / total_ct, float(ct_music) / total_ct, float(ct_noise) / total_ct)
+        return ret
 
 class SpeechMusic(DnnSegmenter):
     # Voice activity detection: requires energetic activity detection
@@ -223,6 +272,23 @@ class Segmenter:
         if detect_gender:
             self.gender = Gender(batch_size)
 
+    def perform_vad(self, mspec, loge, difflen, start_sec):
+        """
+        perform voice activity detection
+        require input corresponding to wav file sampled at 16000Hz
+        with a single channel
+        """
+
+        # perform energy-based activity detection
+        lseg = []
+
+        energy_activ = _energy_activity(loge, self.energy_ratio)[::2]
+        lseg.append(('energy', 0, len(energy_activ)))
+        # perform voice activity detection
+        ret = self.vad.analyze(mspec, lseg, difflen)
+
+        return ret
+
 
     def segment_feats(self, mspec, loge, difflen, start_sec):
         """
@@ -271,7 +337,13 @@ class Segmenter:
             start_sec = 0
         # do segmentation   
         return self.segment_feats(mspec, loge, difflen, start_sec)
-
+    
+    def analyze_chunk(self, medianame, tmpdir=None, start_sec=None, stop_sec=None):
+        mspec, loge, difflen = media2feats(medianame, tmpdir, start_sec, stop_sec, self.ffmpeg)
+        if start_sec is None:
+            start_sec = 0
+        # do vad   
+        return self.perform_vad(mspec, loge, difflen, start_sec)
     
     def batch_process(self, linput, loutput, tmpdir=None, verbose=False, skipifexist=False, nbtry=1, trydelay=2., output_format='csv'):
         
